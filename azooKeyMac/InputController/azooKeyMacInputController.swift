@@ -213,7 +213,7 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
 
         let userAction = UserAction.getUserAction(event: event, inputLanguage: inputLanguage)
 
-        // 英数キー（keyCode 102）の処理
+        // 英数キー（keyCode 102）
         if event.keyCode == 102 {
             let isDoubleTap = checkAndUpdateDoubleTap(keyCode: 102)
 
@@ -281,7 +281,9 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
             enableDebugWindow: Config.DebugWindow().value,
             enableSuggestion: aiBackendEnabled
         )
-        return handleClientAction(clientAction, clientActionCallback: clientActionCallback, client: client)
+        let result = handleClientAction(clientAction, clientActionCallback: clientActionCallback, client: client)
+
+        return result
     }
 
     private var inputStyle: InputStyle {
@@ -409,6 +411,9 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
         case .hideReplaceSuggestionWindow:
             self.replaceSuggestionWindow.setIsVisible(false)
             self.replaceSuggestionWindow.orderOut(nil)
+        // TypoCorrection
+        case .requestTypoCorrection:
+            self.requestTypoCorrection()
         // Selected Text Transform
         case .showPromptInputWindow:
             self.segmentsManager.appendDebugMessage("Executing showPromptInputWindow")
@@ -458,6 +463,10 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
             // 遷移した時にreplaceSuggestionWindowをhideする
             if inputState != .replaceSuggestion {
                 self.replaceSuggestionWindow.orderOut(nil)
+            }
+            // selecting以外に遷移する場合は誤字修正候補をクリア
+            if inputState != .selecting {
+                self.segmentsManager.clearTypoCorrectionCandidates()
             }
             if inputState == .none {
                 self.switchInputLanguage(self.inputLanguage, client: client)
@@ -544,6 +553,7 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
                 )
             )
         }
+
         self.client()?.setMarkedText(
             text,
             selectionRange: currentMarkedText.selectionRange,
@@ -567,6 +577,7 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
         if let candidate = self.segmentsManager.selectedCandidate {
             self.submitCandidate(candidate)
             self.segmentsManager.requestResettingSelection()
+            self.segmentsManager.clearTypoCorrectionCandidates()
         }
     }
 }
@@ -594,6 +605,16 @@ extension azooKeyMacInputController: SegmentManagerDelegate {
         let leftSideContext = self.client().string(from: leftRange, actualRange: &actual)
         self.segmentsManager.appendDebugMessage("\(#function): leftSideContext=\(leftSideContext ?? "nil")")
         return leftSideContext
+    }
+
+    func getRightSideContext(maxCount: Int) -> String? {
+        let markedRange = client().markedRange()
+        let startIndex = markedRange.location + markedRange.length
+        let rightRange = NSRange(location: startIndex, length: maxCount)
+        var actual = NSRange()
+        let rightSideContext = self.client().string(from: rightRange, actualRange: &actual)
+        self.segmentsManager.appendDebugMessage("\(#function): rightSideContext=\(rightSideContext ?? "nil")")
+        return rightSideContext
     }
 }
 
@@ -741,6 +762,112 @@ extension azooKeyMacInputController {
             }
         }
         self.segmentsManager.appendDebugMessage("requestReplaceSuggestion: 終了")
+    }
+
+    // MARK: - Typo Correction Request Handling
+    @MainActor func requestTypoCorrection() {
+        self.segmentsManager.appendDebugMessage("requestTypoCorrection: 開始")
+
+        // Get selected backend preference
+        let preference = Config.AIBackendPreference().value
+        if preference == .off {
+            self.segmentsManager.appendDebugMessage("AI backend is off, skipping typo correction")
+            return
+        }
+
+        // ローマ字入力を取得
+        let romajiString = self.segmentsManager.getCurrentRomajiInput()
+        guard !romajiString.isEmpty else {
+            self.segmentsManager.appendDebugMessage("ローマ字入力が空です")
+            return
+        }
+        self.segmentsManager.appendDebugMessage("ローマ字入力: \(romajiString)")
+
+        // 候補選択モードに遷移（通常候補を表示しながらLLM結果を待つ）
+        self.segmentsManager.insertCompositionSeparator(inputStyle: self.inputStyle, skipUpdate: true)
+        self.segmentsManager.update(requestRichCandidates: true)
+
+        // 前後の文脈を取得してプロンプト形式に整形
+        let leftContext = self.getLeftSideContext(maxCount: 100) ?? ""
+        let rightContext = self.getRightSideContext(maxCount: 100) ?? ""
+        let prompt = "\(leftContext)<\(romajiString)>\(rightContext)"
+        self.segmentsManager.appendDebugMessage("Typo Correction入力: \(prompt)")
+
+        let apiKey = Config.OpenAiApiKey().value
+        let modelName = Config.OpenAiModelName().value
+        // typoCorrection プロンプトを使用
+        let request = OpenAIRequest(prompt: prompt, target: "typoCorrection", modelName: modelName)
+
+        // Get selected backend
+        let backend: AIBackend
+        switch preference {
+        case .off:
+            return
+        case .foundationModels:
+            backend = .foundationModels
+        case .openAI:
+            backend = .openAI
+        }
+        self.segmentsManager.appendDebugMessage("Using backend: \(backend.rawValue)")
+
+        // 非同期タスクでリクエストを送信
+        Task {
+            do {
+                self.segmentsManager.appendDebugMessage("APIリクエスト送信中...")
+                let predictions = try await AIClient.sendRequest(
+                    request,
+                    backend: backend,
+                    apiKey: apiKey,
+                    apiEndpoint: Config.OpenAiApiEndpoint().value,
+                    logger: { [weak self] message in
+                        self?.segmentsManager.appendDebugMessage(message)
+                    }
+                )
+                self.segmentsManager.appendDebugMessage("AIレスポンス: \(predictions)")
+
+                // AIレスポンスをCandidateに変換
+                let candidates = predictions.map { text in
+                    Candidate(
+                        text: text,
+                        value: PValue(0),
+                        composingCount: .surfaceCount(romajiString.count),
+                        lastMid: 0,
+                        data: [],
+                        actions: [],
+                        inputable: true
+                    )
+                }
+
+                self.segmentsManager.appendDebugMessage("変換候補: \(candidates.map { $0.text })")
+
+                // LLM候補を表示
+                await MainActor.run {
+                    if !candidates.isEmpty {
+                        self.segmentsManager.setTypoCorrectionCandidates(candidates)
+                        self.segmentsManager.appendDebugMessage("誤字修正候補を表示")
+                    } else {
+                        // 候補がない場合はローディング状態をクリア
+                        self.segmentsManager.clearTypoCorrectionCandidates()
+                        self.segmentsManager.appendDebugMessage("LLM候補が空のためクリア")
+                    }
+                    self.refreshCandidateWindow()
+                }
+            } catch {
+                let errorMessage = "APIリクエストエラー: \(error.localizedDescription)"
+                self.segmentsManager.appendDebugMessage(errorMessage)
+                // エラー時はローディング状態をクリアして通常モードに戻す
+                await MainActor.run {
+                    self.segmentsManager.clearTypoCorrectionCandidates()
+                    self.refreshCandidateWindow()
+                }
+            }
+        }
+        self.segmentsManager.appendDebugMessage("requestTypoCorrection: 終了")
+    }
+
+    /// ローマ字文字列をKanaKanjiConverterで変換して候補を取得
+    @MainActor private func convertRomajiToCandidates(_ romaji: String) async -> [Candidate] {
+        self.segmentsManager.convertRomajiToCandidates(romaji, inputStyle: self.inputStyle)
     }
 
     // MARK: - Window Management

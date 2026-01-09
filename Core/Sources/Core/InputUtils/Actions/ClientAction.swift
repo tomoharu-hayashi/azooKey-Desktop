@@ -57,6 +57,9 @@ public enum ClientAction {
     case submitReplaceSuggestionCandidate
     case hideReplaceSuggestionWindow
 
+    // TypoCorrection (LLMでローマ字誤字を修正)
+    case requestTypoCorrection
+
     // Selected Text Transform
     case showPromptInputWindow
     case transformSelectedText(String, String)  // (selectedText, prompt)

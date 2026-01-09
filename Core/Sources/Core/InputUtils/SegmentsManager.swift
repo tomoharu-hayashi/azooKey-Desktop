@@ -44,6 +44,10 @@ public final class SegmentsManager {
     private var replaceSuggestions: [Candidate] = []
     private var suggestSelectionIndex: Int?
 
+    // 誤字修正モード（LLM候補のみ表示）
+    private var typoCorrectionCandidates: [Candidate] = []
+    private var isTypoCorrectionLoading: Bool = false
+
     private lazy var zenzaiPersonalizationMode: ConvertRequestOptions.ZenzaiMode.PersonalizationMode? = self.getZenzaiPersonalizationMode()
 
     private func getZenzaiPersonalizationMode() -> ConvertRequestOptions.ZenzaiMode.PersonalizationMode? {
@@ -270,21 +274,30 @@ public final class SegmentsManager {
     }
 
     private var candidates: [Candidate]? {
+        // LLM候補がある場合はそれのみ表示
+        if !typoCorrectionCandidates.isEmpty {
+            return typoCorrectionCandidates
+        }
+
+        // 通常モード（ローディング中も通常候補を表示）
         if let rawCandidates {
+            var result: [Candidate]
             if !self.didExperienceSegmentEdition {
                 if rawCandidates.firstClauseResults.contains(where: { self.composingText.isWholeComposingText(composingCount: $0.composingCount) }) {
                     // firstClauseCandidateがmainResultsと同じサイズの場合は、何もしない方が良い
-                    return rawCandidates.mainResults
+                    result = rawCandidates.mainResults
                 } else {
                     // 変換範囲がエディットされていない場合
                     let seenAsFirstClauseResults = rawCandidates.firstClauseResults.mapSet(transform: \.text)
-                    return rawCandidates.firstClauseResults + rawCandidates.mainResults.filter {
+                    result = rawCandidates.firstClauseResults + rawCandidates.mainResults.filter {
                         !seenAsFirstClauseResults.contains($0.text)
                     }
                 }
             } else {
-                return rawCandidates.mainResults
+                result = rawCandidates.mainResults
             }
+
+            return result
         } else {
             return nil
         }
@@ -532,6 +545,54 @@ public final class SegmentsManager {
             )]
         )
         return candidate
+    }
+
+    /// 現在のローマ字入力を取得
+    @MainActor
+    public func getCurrentRomajiInput() -> String {
+        String(self.composingText.input.compactMap {
+            switch $0.piece {
+            case .compositionSeparator: nil
+            case .character(let c): c
+            case .key(intention: _, input: let input, modifiers: _): input
+            }
+        })
+    }
+
+    /// ローマ字文字列をKanaKanjiConverterで変換して候補を取得
+    @MainActor
+    public func convertRomajiToCandidates(_ romaji: String, inputStyle: InputStyle) -> [Candidate] {
+        // 新しいComposingTextを作成してローマ字を入力
+        var newComposingText = ComposingText()
+        newComposingText.insertAtCursorPosition(romaji, inputStyle: inputStyle)
+
+        // 変換実行
+        let result = self.kanaKanjiConverter.requestCandidates(newComposingText, options: self.options())
+
+        // 上位候補を返す
+        return Array(result.mainResults.prefix(3))
+    }
+
+    /// 誤字修正モードのローディングを開始
+    @MainActor
+    public func startTypoCorrectionLoading() {
+        self.isTypoCorrectionLoading = true
+        self.typoCorrectionCandidates = []
+        self.shouldShowCandidateWindow = true
+    }
+
+    /// 誤字修正候補を設定（LLM候補のみ表示）
+    @MainActor
+    public func setTypoCorrectionCandidates(_ candidates: [Candidate]) {
+        self.isTypoCorrectionLoading = false
+        self.typoCorrectionCandidates = candidates
+    }
+
+    /// 誤字修正モードをクリア
+    @MainActor
+    public func clearTypoCorrectionCandidates() {
+        self.isTypoCorrectionLoading = false
+        self.typoCorrectionCandidates = []
     }
 
     @MainActor

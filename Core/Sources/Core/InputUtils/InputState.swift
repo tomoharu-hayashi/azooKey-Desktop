@@ -153,8 +153,10 @@ public enum InputState: Sendable, Hashable {
                 case .ten:
                     return (.submitHalfWidthRomanCandidate, .transition(.none))
                 }
-            case .forget, .tab:
+            case .forget:
                 return (.consume, .fallthrough)
+            case .tab:
+                return (.requestTypoCorrection, .transition(.selecting))
             case .英数:
                 return (.selectInputLanguage(.english), .fallthrough)
             case .かな:
